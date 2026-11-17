@@ -1,0 +1,14 @@
+#!/bin/bash -e
+
+TEST_CMD='go test -mod=vendor -coverprofile=output/c.out -v ./... | tee junit.output && cat junit.output | go-junit-report > output/junit.xml'
+
+echo "Running unit tests"
+docker build --pull -t summon-builder .
+
+rm -f "output/*.xml"
+
+docker run --rm -t \
+           -v "$PWD/output:/summon/output" \
+           summon-builder bash -c "$TEST_CMD;
+              gocov convert output/c.out | gocov-xml > output/coverage.xml;
+           "

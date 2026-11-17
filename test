@@ -1,0 +1,4 @@
+#!/bin/bash -e
+
+./test_unit
+./test_acceptance

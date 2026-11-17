@@ -1,0 +1,266 @@
+package summon
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os/exec"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+
+	"github.com/cyberark/summon/internal/memzero"
+	"github.com/cyberark/summon/pkg/conjurprovider"
+	prov "github.com/cyberark/summon/pkg/provider"
+	"github.com/cyberark/summon/pkg/secretsyml"
+)
+
+// fetchSecrets encapsulates the logic of fetching secrets from the provider, including filtering non-variable secrets,
+// handling results from the provider, and falling back to non-interactive mode if necessary.
+func fetchSecrets(ctx context.Context, secrets secretsyml.SecretsMap, sc *SubprocessConfig, tempFactory *TempFactory) ([]prov.Result, error) {
+	slog.Debug("Fetching secrets", "count", len(secrets), "provider", sc.Provider)
+
+	// Filter out non-variable secrets (literals, file specs, etc.).
+	filteredResults, filteredSecrets := filterNonVariables(secrets, tempFactory)
+	results := filteredResults
+
+	if sc.Provider == conjurprovider.BuiltinProviderPath {
+		// Built-in Conjur provider: fetch sequentially with short-circuit on the
+		// first error. Skip interactive mode entirely — this Path value is not
+		// an external binary.
+		builtinResults, err := fetchSecretsBuiltin(ctx, filteredSecrets, sc, tempFactory)
+		if err != nil {
+			return nil, err
+		}
+		return append(results, builtinResults...), nil
+	}
+
+	// Skip provider invocation entirely when there are no variable secrets to fetch.
+	// CallInteractiveMode would start the provider binary but never write to its stdin,
+	// blocking indefinitely until a timeout fires.
+	if len(filteredSecrets) == 0 {
+		slog.Debug("No variable secrets to fetch; skipping provider invocation", "provider", sc.Provider)
+		return results, nil
+	}
+
+	if sc.VerifyProvider != nil {
+		if err := sc.VerifyProvider(); err != nil {
+			return nil, err
+		}
+	}
+
+	// External provider: try interactive mode first, fall back to non-interactive.
+	resultsCh, errorsCh, cleanup := prov.CallInteractiveMode(ctx, sc.Provider, filteredSecrets)
+	defer cleanup()
+
+	resultsFromProvider, err := handleResultsFromProvider(resultsCh, errorsCh, filteredSecrets, tempFactory)
+	results = append(results, resultsFromProvider...)
+
+	// A done context killed the provider; its partial output must neither be
+	// used nor trigger the per-secret fallback.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if err != nil {
+		results = nonInteractiveProviderFallback(ctx, secrets, sc, tempFactory)
+	}
+
+	return results, nil
+}
+
+// fetchSecretsBuiltin fetches secrets one at a time using the built-in Conjur
+// provider and short-circuits on the first error, leaving remaining secrets
+// unfetched. The ignore list (sc.Ignores / sc.IgnoreAll) is respected.
+func fetchSecretsBuiltin(ctx context.Context, secrets secretsyml.SecretsMap, sc *SubprocessConfig, tempFactory *TempFactory) ([]prov.Result, error) {
+	// Sort keys for deterministic ordering.
+	keys := make([]string, 0, len(secrets))
+	for key := range secrets {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	results := make([]prov.Result, 0, len(secrets))
+	for _, key := range keys {
+		spec := secrets[key]
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		slog.Debug("Fetching secret", "name", key, "provider", sc.Provider)
+		secretBytes, err := sc.FetchSecret(ctx, spec.Path)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err() // never "ignore" an aborted fetch
+			}
+			if sc.IgnoreAll || slices.Contains(sc.Ignores, key) {
+				slog.Debug("Ignoring fetch error", "name", key, "error", err)
+				continue
+			}
+			// Short-circuit: return immediately without fetching remaining secrets.
+			return nil, err
+		}
+
+		var value string
+		if len(secretBytes) > 0 {
+			value = string(secretBytes)
+			memzero.Clear(secretBytes) // zero secret bytes immediately after string conversion
+		}
+
+		if value == "" && spec.DefaultValue != "" {
+			value = spec.DefaultValue
+		}
+
+		kFormatted, valueFormatted, formatErr := formatForEnv(key, value, spec, tempFactory)
+		if formatErr != nil {
+			return nil, formatErr
+		}
+		results = append(results, prov.Result{Key: kFormatted, Value: valueFormatted})
+	}
+	return results, nil
+}
+
+func filterNonVariables(secrets secretsyml.SecretsMap, tempFactory *TempFactory) ([]prov.Result, secretsyml.SecretsMap) {
+	filteredSecrets := make(secretsyml.SecretsMap)
+	results := []prov.Result{}
+
+	for key, spec := range secrets {
+		if spec.IsVar() {
+			filteredSecrets[key] = spec
+		} else {
+			value := spec.Path
+			if value == "" && spec.DefaultValue != "" {
+				value = spec.DefaultValue
+			}
+			k, v, err := formatForEnv(key, value, spec, tempFactory)
+			var result prov.Result
+			if err != nil {
+				result = prov.Result{Key: key, Value: "", Error: err}
+			} else {
+				result = prov.Result{Key: k, Value: v, Error: nil}
+			}
+			results = append(results, result)
+		}
+	}
+
+	return results, filteredSecrets
+}
+
+func handleResultsFromProvider(resultsCh chan prov.Result, errorsCh chan error,
+	filteredSecrets secretsyml.SecretsMap, tempFactory *TempFactory) (results []prov.Result, err error) {
+	for {
+		select {
+		case result, ok := <-resultsCh:
+			if !ok {
+				return results, nil
+			}
+
+			spec := filteredSecrets[result.Key]
+
+			// Set a default value if the provider didn't return one for the item
+			if result.Value == "" && spec.DefaultValue != "" {
+				result.Value = spec.DefaultValue
+			}
+			k, v, err := formatForEnv(result.Key, result.Value, spec, tempFactory)
+			if err != nil {
+				result = prov.Result{Key: result.Key, Value: "", Error: err}
+			} else {
+				result = prov.Result{Key: k, Value: v, Error: nil}
+			}
+			results = append(results, result)
+
+		// Fallback to the old implementation if either provider doesn't support interactive mode or an error occured
+		case err = <-errorsCh:
+			return nil, err
+		}
+	}
+}
+
+func nonInteractiveProviderFallback(ctx context.Context, secrets secretsyml.SecretsMap, sc *SubprocessConfig, tempFactory *TempFactory) []prov.Result {
+	results := make(chan prov.Result, len(secrets))
+	var wg sync.WaitGroup
+
+	for key, spec := range secrets {
+		wg.Add(1)
+		go func(key string, spec secretsyml.SecretSpec) {
+			defer wg.Done()
+
+			var value string
+			if spec.IsVar() {
+				slog.Debug("Fetching secret", "name", key, "provider", sc.Provider)
+				valueBytes, err := sc.FetchSecret(ctx, spec.Path)
+				if err != nil {
+					results <- prov.Result{Key: key, Value: "", Error: err}
+					return
+				}
+				value = string(valueBytes)
+				memzero.Clear(valueBytes)
+			} else {
+				// If the spec isn't a variable, use its value as-is
+				value = spec.Path
+			}
+
+			// Set a default value if the provider didn't return one for the item
+			if value == "" && spec.DefaultValue != "" {
+				value = spec.DefaultValue
+			}
+
+			k, v, err := formatForEnv(key, value, spec, tempFactory)
+			if err != nil {
+				results <- prov.Result{Key: key, Value: "", Error: err}
+			} else {
+				results <- prov.Result{Key: k, Value: v, Error: nil}
+			}
+		}(key, spec)
+	}
+	wg.Wait()
+	close(results)
+
+	resultsSlice := make([]prov.Result, 0, len(secrets))
+	for result := range results {
+		resultsSlice = append(resultsSlice, result)
+	}
+	return resultsSlice
+}
+
+func returnStatusOfError(err error) (int, error) {
+	if eerr, ok := err.(*exec.ExitError); ok {
+		if ws, ok := eerr.Sys().(syscall.WaitStatus); ok {
+			if ws.Exited() {
+				return ws.ExitStatus(), nil
+			}
+		}
+	}
+	return 0, err
+}
+
+// formatForEnv returns a string in %k=%v format, where %k=namespace of the secret and
+// %v=the secret value or path to a temporary file containing the secret
+func formatForEnv(key string, value string, spec secretsyml.SecretSpec, tempFactory *TempFactory) (string, string, error) {
+	if spec.IsFile() {
+		fname, err := tempFactory.Push(value)
+		if err != nil {
+			return "", "", err
+		}
+		value = fname
+	}
+
+	return key, value, nil
+}
+
+func joinEnv(env map[string]string) string {
+	var envs []string
+	for k, v := range env {
+		if strings.ContainsAny(v, " \t\n\r\"'\\") {
+			v = strconv.Quote(v)
+		}
+		envs = append(envs, fmt.Sprintf("%s=%s", k, v))
+	}
+
+	// Sort to ensure predictable results
+	sort.Strings(envs)
+
+	return strings.Join(envs, "\n") + "\n"
+}

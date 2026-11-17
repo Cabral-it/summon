@@ -1,0 +1,56 @@
+package command
+
+import (
+	"github.com/urfave/cli"
+)
+
+// Flags define all the available CLI switches and aargs that a user can provide
+var Flags = []cli.Flag{
+	cli.StringFlag{
+		Name:  "p, provider",
+		Usage: "Path to provider for fetching secrets",
+	},
+	cli.StringFlag{
+		Name:  "e, environment",
+		Usage: "Specify section/environment to parse from secrets.yaml",
+	},
+	cli.StringFlag{
+		Name:  "f",
+		Value: "secrets.yml",
+		Usage: "Path to secrets.yml",
+	},
+	cli.BoolFlag{
+		Name:  "up",
+		Usage: "Go up in the directory hierarchy until the secrets file is found",
+	},
+	cli.StringSliceFlag{
+		Name:  "D",
+		Value: &cli.StringSlice{},
+		Usage: "var=value causes substitution of value to $var",
+	},
+	cli.StringFlag{
+		Name:  "yaml",
+		Usage: "secrets.yml as a literal string",
+	},
+	cli.StringSliceFlag{
+		Name:  "ignore, i",
+		Value: &cli.StringSlice{},
+		Usage: "Ignore the specified key if is isn't accessible or doesn't exist",
+	},
+	cli.BoolFlag{
+		Name:  "ignore-all, I",
+		Usage: "Ignore inaccessible or missing keys",
+	},
+	cli.BoolFlag{
+		Name:  "all-provider-versions, V",
+		Usage: "List of all of the providers in the default path and their versions(if they have the --version tag)",
+	},
+	cli.BoolFlag{
+		Name:  "refresh, daemon, sidecar",
+		Usage: "Keep running: re-fetch secrets on an interval, rewrite changed secret files and restart the subprocess (see SUMMON_REFRESH_* and SUMMON_RESTART_ON_ROTATION)",
+	},
+	cli.BoolFlag{
+		Name:  "debug, d",
+		Usage: "Enable debug logging",
+	},
+}

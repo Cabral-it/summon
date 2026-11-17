@@ -1,0 +1,235 @@
+#!/bin/bash -e
+
+export CONJUR_ACCOUNT=cucumber
+
+# Conjur images only (see docker-compose.yml). Public images do not use this.
+export REGISTRY_URL="${REGISTRY_URL:-${INFRAPOOL_REGISTRY_URL:-registry.tld}}"
+
+source ./bin/functions.sh
+
+function finish {
+  echo 'Removing environment'
+  echo '-----'
+  # Drop decoded credentials even if prepareJWT / compose fails mid-run.
+  unset -v CONJUR_AUTHN_TOKEN JWT PUBLIC_KEYS 2>/dev/null || true
+  if docker compose ps -q conjur 2>/dev/null | grep -q .; then
+    mkdir -p output/integration
+    docker compose logs conjur > output/integration/conjur-logs.txt 2>&1 || true
+  fi
+  if [[ "${TEST_CERT:-false}" == "true" ]]; then
+    docker compose --profile cert logs conjur-leader >> output/integration/conjur-leader-logs.txt 2>&1 || true
+    docker compose --profile cert down -v --remove-orphans || true
+  fi
+  if [[ "${TEST_SPIFFE:-false}" == "true" ]]; then
+    mkdir -p output/integration
+    # Enterprise Appliance logs go to Docker stdout (runit/svlogd), not a file.
+    docker compose --profile spiffe logs conjur-leader >> output/integration/conjur-leader-logs.txt 2>&1 || true
+    docker compose --profile spiffe logs spire-server >> output/integration/spire-server-logs.txt 2>&1 || true
+    docker compose --profile spiffe logs spire-agent >> output/integration/spire-agent-logs.txt 2>&1 || true
+    docker compose --profile spiffe down -v --remove-orphans || true
+  fi
+  docker compose down -v
+}
+trap finish EXIT
+
+function failed {
+  echo 'TESTS FAILED'
+  echo '-----'
+  echo 'Conjur logs:'
+  docker compose logs conjur || true
+  if [[ "${TEST_CERT:-false}" == "true" ]]; then
+    echo 'Conjur Enterprise logs:'
+    docker compose --profile cert logs conjur-leader || true
+  fi
+  if [[ "${TEST_SPIFFE:-false}" == "true" ]]; then
+    echo 'Conjur Enterprise (SPIFFE) logs:'
+    docker compose --profile spiffe logs conjur-leader || true
+  fi
+  echo '-----'
+  exit 1
+}
+
+function main() {
+  if [[ "${INFRAPOOL_TEST_SAAS}" == "true" ]]; then
+    runSaaSTests
+    return
+  fi
+
+  startConjur
+  initEnvironment
+  prepareAWS
+  prepareGCP
+  prepareCertIfNeeded
+  prepareJWT
+  prepareSpiffeIfNeeded
+  runTests
+}
+
+function prepareCertIfNeeded() {
+  if [[ "${INFRAPOOL_TEST_CERT}" == "true" || "${TEST_CERT}" == "true" ]]; then
+    export TEST_CERT=true
+    # shellcheck source=bin/setup-cert-auth.sh
+    source ./bin/setup-cert-auth.sh
+  fi
+}
+
+function prepareSpiffeIfNeeded() {
+  if [[ "${INFRAPOOL_TEST_SPIFFE:-false}" == "true" || "${TEST_SPIFFE:-false}" == "true" ]]; then
+    export TEST_SPIFFE=true
+    # shellcheck source=bin/setup-spiffe.sh
+    source ./bin/setup-spiffe.sh
+  fi
+}
+
+function prepareAWS() {
+  if [[ "${INFRAPOOL_TEST_AWS}" == "true" ]]; then
+    if [[ -z "${CONJUR_AWS_ACCOUNT_ID:-}" ]] || [[ -z "${CONJUR_AWS_ROLE_NAME:-}" ]]; then
+      echo "ERROR: CONJUR_AWS_ACCOUNT_ID and CONJUR_AWS_ROLE_NAME must be set when TEST_AWS=true (provided by summon via secrets.yml)."
+      exit 1
+    fi
+  fi
+}
+
+function prepareGCP() {
+  if [[ "${INFRAPOOL_TEST_GCP}" == "true" ]]; then
+    GCP_PROJECT_ID=""
+    GCP_ID_TOKEN=""
+    if [[ -f "gcp/project-id" ]]; then
+      read -r GCP_PROJECT_ID < "gcp/project-id"
+    fi
+    if [[ -f "gcp/token" ]]; then
+      read -r GCP_ID_TOKEN < "gcp/token"
+    fi
+    if [[ -z "$GCP_PROJECT_ID" || -z "$GCP_ID_TOKEN" ]]; then
+      echo "GCP_PROJECT_ID and GCP_ID_TOKEN must be set to run GCP tests"
+      failed
+    fi
+    export GCP_PROJECT_ID
+    export GCP_ID_TOKEN
+  fi
+}
+
+function runSaaSTests() {
+  export CONJUR_APPLIANCE_URL="${INFRAPOOL_CONJUR_APPLIANCE_URL}/api"
+  export CONJUR_ACCOUNT=conjur
+  export CONJUR_AUTHN_LOGIN="${INFRAPOOL_CONJUR_AUTHN_LOGIN}"
+  # printf avoids echo's trailing newline; strip any newline from the decoded token.
+  export CONJUR_AUTHN_TOKEN="$(printf '%s' "${INFRAPOOL_CONJUR_AUTHN_TOKEN}" | base64 --decode | tr -d '\n')"
+  export TEST_SAAS=true
+
+  prepareJWT
+
+  local arch="${TARGETARCH:-amd64_v1}"
+  local binarypath="dist/goreleaser/summon-linux_linux_${arch}/summon"
+
+  if [[ ! -f "${binarypath}" ]]; then
+    echo "ERROR: Pre-built summon binary not found at ${binarypath}"
+    echo "Build it first with: ./build --snapshot"
+    exit 1
+  fi
+
+  mkdir -p output/integration
+
+  docker compose build --pull \
+    --build-arg TARGETARCH="${TARGETARCH:-amd64_v1}" \
+    --build-arg BINARYPATH="${binarypath}" \
+    test
+
+  docker compose run --rm --no-deps \
+    -e CONJUR_APPLIANCE_URL \
+    -e CONJUR_ACCOUNT \
+    -e CONJUR_AUTHN_LOGIN \
+    -e CONJUR_AUTHN_TOKEN \
+    -e CONJUR_IGNORE_UNTRUSTED_SSL=true \
+    -e TEST_SAAS \
+    -e JWT \
+    -e PUBLIC_KEYS \
+    test ./bin/test-entrypoint.sh || failed
+
+  unset -v CONJUR_AUTHN_TOKEN JWT PUBLIC_KEYS
+}
+
+function runTests() {
+  local service=test
+
+  local arch="${TARGETARCH:-amd64_v1}"
+  local binarypath="dist/goreleaser/summon-linux_linux_${arch}/summon"
+
+  # Guard: fail fast with a clear message if the pre-built binary is missing.
+  # Build it first with: ./build --snapshot
+  if [[ ! -f "${binarypath}" ]]; then
+    echo "ERROR: Pre-built summon binary not found at ${binarypath}"
+    echo "Build it first with: ./build --snapshot"
+    exit 1
+  fi
+
+  # Map Jenkinsfile infra env vars to test-level env vars
+  export TEST_AWS="${INFRAPOOL_TEST_AWS:-}"
+  export TEST_AZURE="${INFRAPOOL_TEST_AZURE:-}"
+  export TEST_GCP="${INFRAPOOL_TEST_GCP:-}"
+  export TEST_CERT="${TEST_CERT:-${INFRAPOOL_TEST_CERT:-false}}"
+
+  mkdir -p output/integration
+
+  if [[ "$TEST_CERT" == "true" ]]; then
+    if [[ -z "${CERT_TMPDIR:-}" || ! -d "${CERT_TMPDIR}" ]]; then
+      echo "ERROR: TEST_CERT=true but CERT_TMPDIR is missing or not a directory (PKI setup failed?)"
+      exit 1
+    fi
+  fi
+
+  # Mount generated client certs into the summon test container only (not conjur-leader).
+  CERT_EXTRA_ARGS=()
+  if [[ "$TEST_CERT" == "true" ]]; then
+    CERT_EXTRA_ARGS+=("-v" "$CERT_TMPDIR:/certs:ro")
+  fi
+
+  docker compose build --pull \
+    --build-arg TARGETARCH="${TARGETARCH:-amd64_v1}" \
+    --build-arg BINARYPATH="${binarypath}" \
+    $service
+
+  docker compose run --rm \
+    "${CERT_EXTRA_ARGS[@]}" \
+    -e CONJUR_ACCOUNT \
+    -e CONJUR_APPLIANCE_URL \
+    -e CONJUR_AUTHN_LOGIN \
+    -e CONJUR_AUTHN_API_KEY \
+    -e CONJUR_ADMIN_LOGIN \
+    -e CONJUR_ADMIN_API_KEY \
+    -e TEST_AWS \
+    -e TEST_GCP \
+    -e GCP_PROJECT_ID \
+    -e GCP_ID_TOKEN \
+    -e TEST_AZURE \
+    -e AZURE_SUBSCRIPTION_ID \
+    -e AZURE_RESOURCE_GROUP \
+    -e AZURE_TENANT_ID \
+    -e CONJUR_AWS_ACCOUNT_ID \
+    -e CONJUR_AWS_ROLE_NAME \
+    -e TEST_CERT \
+    -e CONJUR_CERT_APPLIANCE_URL \
+    -e CONJUR_CERT_AUTHN_LOGIN \
+    -e CONJUR_CERT_AUTHN_API_KEY \
+    -e CONJUR_CERT_SSL_CERTIFICATE \
+    -e CONJUR_AUTHN_CERT_FILE \
+    -e CONJUR_AUTHN_CERT_KEY_FILE \
+    -e TEST_CERT_CA_CERT \
+    -e CONJUR_SSL_CERTIFICATE \
+    -e TEST_SAAS \
+    -e TEST_SPIFFE \
+    -e SPIFFE_ENDPOINT_SOCKET \
+    -e CONJUR_AUTHN_CERT_SERVICE_ID \
+    -e CONJUR_AUTHN_CERT_HOST_ID \
+    -e CONJUR_AUTHN_JWT_SPIFFE_SERVICE_ID \
+    -e CONJUR_AUTHN_JWT_SPIFFE_OIDC_SERVICE_ID \
+    -e CONJUR_AUTHN_JWT_HOST_ID \
+    -e CONJUR_SPIFFE_ID \
+    -e CONJUR_SPIFFE_TEST_SECRET_ID \
+    -e CONJUR_SPIFFE_TEST_SECRET_VALUE \
+    -e JWT \
+    -e PUBLIC_KEYS \
+    "$service" || failed
+}
+
+main

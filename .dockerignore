@@ -1,0 +1,11 @@
+.git
+output/*
+build.sh
+_site
+.vagrant
+Vagrantfile
+summon
+Godeps/
+
+# Vim editor tempfiles
+*.sw[po]

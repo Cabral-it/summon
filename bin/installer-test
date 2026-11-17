@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -e
+
+while [[ $# -gt 0 ]]; do
+  key="$1"
+  case $key in
+    --ubuntu-24.04)
+    ubuntu_24_04=true
+    ;;
+    --ubuntu-22.04)
+    ubuntu_22_04=true
+    ;;
+    *)
+    echo "Unknown parameter! Exiting!"
+    exit 1
+    ;;
+  esac
+  shift # past argument or value
+done
+
+# Validate Summon installs without `sudo` present
+run_test() {
+  local image_tag="$1"
+  docker pull "ubuntu:$image_tag"
+  docker run --rm \
+             -v "$PWD:/summon:ro" \
+             -t "ubuntu:$image_tag" bash -cex '
+    apt-get update
+    apt-get install -y curl
+    /summon/install.sh
+    summon --version
+  '
+}
+
+if [[ $ubuntu_24_04 = true ]]; then
+  run_test "24.04"
+fi
+
+if [[ $ubuntu_22_04 = true ]]; then
+  run_test "22.04"
+fi
